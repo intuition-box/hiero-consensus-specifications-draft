@@ -551,7 +551,7 @@ Implementations SHOULD preserve the ability to recompute historical trust scores
 [Composite AI Trust Score](#composite-ai-trust-score) defines exactly one way to combine
 adapter totals: a weighted mean. That is sufficient to express *how much* a dimension
 matters, but not *whether a dimension governs* — a policy such as "if a safety dimension
-falls below a floor, cap the composite regardless of the other dimensions" cannot be
+falls below a threshold, cap the composite regardless of the other dimensions" cannot be
 written as a coefficient.
 
 This section defines an OPTIONAL **composition graph** that expresses such policies as
@@ -563,6 +563,12 @@ default weighted mean.
 is exactly as defined in [Composite AI Trust Score](#composite-ai-trust-score), and this
 section imposes no requirements.** An implementation MAY decline to support composition graphs
 and remain conformant with this standard.
+
+An implementation that does not support composition graphs MUST reject a scoring
+configuration that defines one, and MUST report it as unsupported. It MUST NOT ignore the
+graph and compute [Composite AI Trust Score](#composite-ai-trust-score) instead: doing so
+would emit a score under different semantics than the configuration's author specified,
+with nothing in the record to indicate that the declared policy never ran.
 
 This standard does not specify who authors a scoring configuration. A composition graph MAY be
 fixed by the implementation producing scores, selected by a consumer from a set the
@@ -577,16 +583,83 @@ A scoring configuration `C` MAY include a **composition graph**: a directed acyc
 named nodes, each applying one operator to an ordered list of inputs, with one node
 designated as the graph's **output**.
 
-A composition graph MUST declare:
+Because a composition graph is intended to be portable between implementations, its
+representation is normative. The same graph MUST serialize and interpret identically
+everywhere. This section defines that representation; it does not constrain how a
+configuration is stored or transported.
 
-- a set of uniquely named nodes;
-- for each node, an operator from the [Operator Catalog](#operator-catalog), an ordered
-  list of input references, and any parameters that operator requires; and
-- the name of the output node.
+```json
+{
+  "id": "sha256:9f2c1ab4e7d05836a1c4e2fb77a90d3e5c81b6f4a2093de7cc15b840e6a37f21",
+  "nodes": [
+    {
+      "name": "quality",
+      "operator": "weightedMean",
+      "inputs": ["adapter:availability", "adapter:performance", "adapter:reputation"],
+      "parameters": { "weights": [1, 1, 1] }
+    },
+    {
+      "name": "governed",
+      "operator": "cap",
+      "inputs": ["node:quality", "adapter:sybil-resistance"]
+    }
+  ],
+  "output": "governed"
+}
+```
+
+##### Graph object
+
+| Field | Type | Requiredness | Description |
+| --- | --- | --- | --- |
+| `id` | string | REQUIRED | Stable graph identifier. See [Graph Identity](#graph-identity). |
+| `nodes` | array of [Node object](#node-object) | REQUIRED | At least one node. Node names MUST be unique. |
+| `output` | string | REQUIRED | The `name` of the node whose value becomes the composed score. |
+
+##### Node object
+
+| Field | Type | Requiredness | Description |
+| --- | --- | --- | --- |
+| `name` | string | REQUIRED | Unique within the graph. MUST match `^[a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*$`. |
+| `operator` | string | REQUIRED | A core operator from the [Operator Catalog](#operator-catalog), or an extension operator identifier. |
+| `inputs` | array of string | REQUIRED | Ordered [input references](#input-references). Order is significant and MUST be preserved. MUST be absent or empty for `constant`. |
+| `parameters` | object | CONDITIONAL | REQUIRED when the operator declares parameters; MUST be absent or empty otherwise. |
+
+`nodes` is an array rather than a name-keyed object so that duplicate node names are
+detectable rather than resolved by serializer behaviour.
+
+##### Operator parameters
+
+| Operator | Parameter | Type | Requiredness |
+| --- | --- | --- | --- |
+| `weightedMean` | `weights` | array of number, each `≥ 0`, length equal to the node's declared `inputs` length | REQUIRED |
+| `gate` | `below` | number in `[0,100]` | REQUIRED |
+| `gate` | `cap` | number in `[0,100]` | REQUIRED |
+| `constant` | `value` | number in `[0,100]` | REQUIRED |
+| `mean`, `min`, `max`, `median`, `cap` | — | — | none |
+
+##### Input arity
+
+| Operator | Declared inputs |
+| --- | --- |
+| `cap`, `gate` | exactly 2 — the primary input, then the limiting or condition input |
+| `weightedMean`, `mean`, `min`, `max`, `median` | one or more |
+| `constant` | none |
 
 #### Input References
 
-Each node input MUST be a reference of one of the following forms:
+Each node input MUST be a reference matching one of the following forms:
+
+```text
+reference   = "adapter:" adapterId
+            / "component:" componentKey
+            / "node:" nodeName
+```
+
+where `adapterId` matches [Adapter Identifier Namespacing](#adapter-identifier-namespacing),
+`componentKey` matches [Component Keys](#component-keys), and `nodeName` is the `name` of a
+node in the same graph. A reference MUST NOT contain leading or trailing whitespace, and
+comparison is exact — references are not matched case-insensitively.
 
 - `adapter:{adapterId}` — the adapter total of `a`, as defined in
   [Adapter Total](#adapter-total). If `a` is not in `A_denominator`, the reference is
@@ -610,29 +683,79 @@ Every operator MUST be deterministic, MUST depend only on its inputs and declare
 parameters, and MUST return a value in `[0,100]` rounded per
 [Score Range and Rounding](#score-range-and-rounding).
 
-Let `V = [v₁ … vₙ]` be the values of a node's **available** inputs, in declaration order.
+Let a node's **declared** inputs be `I = [i₁ … iₘ]` in declaration order, and let `A ⊆ I`
+be those that are **available** (see
+[Availability and Status Propagation](#availability-and-status-propagation)), preserving
+declaration order. `vⱼ` is the value of input `iⱼ`.
 
 | Operator | Parameters | Result |
 | --- | --- | --- |
-| `weightedMean` | `weights` `[w₁ … wₙ]`, `wᵢ ≥ 0` | `Σ(vᵢ · wᵢ) / Σwᵢ` |
-| `mean` | — | `Σvᵢ / n` |
-| `min` | — | `min(V)` |
-| `max` | — | `max(V)` |
-| `median` | — | middle value of sorted `V`; mean of the two middle values when `n` is even |
-| `floor` | — | `min(v₁, v₂)`, where `v₁` is the primary input and `v₂` the floor |
-| `gate` | `below`, `cap` | `v₂ < below ? min(v₁, cap) : v₁`, where `v₁` is the primary input and `v₂` the condition |
+| `weightedMean` | `weights` `[w₁ … wₘ]`, `wⱼ ≥ 0` | `Σ_{iⱼ ∈ A}(vⱼ · wⱼ) / Σ_{iⱼ ∈ A} wⱼ` |
+| `mean` | — | arithmetic mean of `{vⱼ : iⱼ ∈ A}` |
+| `min` | — | smallest value in `A` |
+| `max` | — | largest value in `A` |
+| `median` | — | middle value of the sorted values in `A`; mean of the two middle values when `\|A\|` is even |
+| `cap` | — | `min(v₁, v₂)` — the primary input `i₁` limited so it does not exceed the limiting input `i₂` |
+| `gate` | `below`, `cap` | `v₂ < below ? min(v₁, cap) : v₁`, where `i₁` is the primary input and `i₂` the condition |
 | `constant` | `value` | `value` |
 
-For `weightedMean`, if `Σwᵢ = 0` the node is **unavailable**.
+**Weights bind to declared inputs.** For `weightedMean`, `weights` MUST have exactly `m`
+entries — one per *declared* input — and `wⱼ` MUST remain bound to `iⱼ` regardless of which
+inputs are available. Implementations MUST NOT re-index weights against the available-input
+list; doing so would silently apply one input's weight to another. A `weights` list whose
+length differs from the declared input count MUST be rejected as a configuration error. If
+`Σ_{iⱼ ∈ A} wⱼ = 0` the node is **unavailable**.
 
-`floor` and `gate` are ordered, two-input operators: the first input is the primary value
-being governed, the second is the floor or condition. Implementations MUST NOT reorder
-their inputs.
+`cap` imposes an **upper** bound: it limits the primary input to the limiting input's value.
+It is not a lower bound — `cap(20, 60) = 20`, not `60`. A lower bound is expressed with
+`max`. `gate` is the conditional form of the same idea: it caps the primary input at the
+constant `cap`, but only when the condition input falls below `below`.
 
-Implementations MAY define additional operators. Any additional operator MUST satisfy the
-determinism and range requirements above, and MUST be declared in the published
-configuration; a composition graph using an operator the evaluating implementation does not
-recognize MUST be rejected as a configuration error rather than silently ignored.
+`cap` and `gate` are ordered, two-input operators: the first input is the primary value
+being governed, the second is the limiting or condition input. Implementations MUST NOT
+reorder their inputs.
+
+##### Extension operators
+
+The core operator names in the table above are **reserved**. An implementation MUST NOT
+redefine them, and MUST NOT accept a graph that uses a reserved name with different
+semantics.
+
+Implementations MAY define additional operators. Because two implementations could otherwise
+each define an operator such as `riskAdjusted` with different semantics — so that the same
+graph evaluated differently depending on where it landed — an extension operator identifier
+MUST be namespaced and versioned:
+
+```text
+extension-operator = namespace 1*("." label) "." localName "@" semver
+namespace          = lowercase reverse-DNS label, e.g. "com"
+label              = lowercase label, e.g. "example"
+localName          = camelCase operator name, as the core catalog uses
+semver             = MAJOR "." MINOR "." PATCH
+```
+
+Equivalent regular expression:
+
+```
+^[a-z][a-z0-9]*(?:\.[a-z][a-z0-9-]*)*\.[a-zA-Z][a-zA-Z0-9]*@\d+\.\d+\.\d+$
+```
+
+For example `com.example.riskAdjusted@2.1.0`.
+
+An extension operator MUST:
+
+- satisfy the determinism and range requirements above;
+- carry a resolvable reference to a normative definition of its semantics, published
+  alongside the configuration; and
+- change its major version when its semantics change in a way that is not backwards
+  compatible, so that semantics cannot drift under a fixed identifier.
+
+A composition graph using an operator the evaluating implementation does not recognize —
+whether an unknown core name or an extension operator identifier or version it does not
+implement — MUST be rejected as a configuration error rather than silently ignored. This
+mirrors the stable, namespaced identifiers this standard already requires of adapters
+(see [Adapter Identifier Namespacing](#adapter-identifier-namespacing)) and trust signals
+(see [Signal Identifier Namespacing](#signal-identifier-namespacing)).
 
 #### Availability and Status Propagation
 
@@ -643,17 +766,100 @@ consistent with [Missing and Stale Data](#missing-and-stale-data).
    to `0`.
 2. For `min`, `max`, `mean`, `median` and `weightedMean`, if every input is unavailable
    the node is unavailable.
-3. For `floor` and `gate`, if the primary input is unavailable the node is unavailable.
-   If the floor or condition input is unavailable, the node's value MUST be the primary
-   input unchanged, and the node MUST be reported as having applied no constraint. A
-   missing safety signal MUST NOT silently impose a cap, and MUST NOT silently remove one.
-4. A node's status MUST be the most severe status among its contributing inputs, using the
+3. For `cap` and `gate`, if the primary input is unavailable the node is unavailable.
+4. For `cap` and `gate`, the limiting or condition input MUST have status `ok` or `stale`
+   for a constraint to be applied. If its status is `missing`, `timeout`, or `error`, the
+   node's value MUST be the primary input unchanged, and the node MUST be reported as
+   having applied no constraint.
+
+   This applies whether the input was omitted as unavailable **or** carries a deterministic
+   `0` produced by its adapter's contribution mode (see
+   [Contribution Modes](#contribution-modes) and
+   [Missing and Stale Data](#missing-and-stale-data)). A `0` that stands for "not measured"
+   is not a measured limit of zero: reading it as one would clamp the composite to `0`
+   precisely when the governing signal failed to arrive. A missing safety signal MUST NOT
+   silently impose a cap, and MUST NOT silently remove one.
+5. A node's status MUST be the most severe status among its contributing inputs, using the
    codes in [Signal Status Codes](#signal-status-codes) and the ordering
    `ok` < `stale` < {`missing`, `timeout`, `error`}.
 
 The staleness multiplier defined in [Missing and Stale Data](#missing-and-stale-data) is
 applied during normalization, before the composition graph is evaluated. The composition
 graph MUST NOT apply it a second time.
+
+#### Validation
+
+A composition graph that violates any of the following MUST be rejected as a configuration
+error. An implementation MUST NOT evaluate a partially valid graph, and MUST NOT fall back
+to [Composite AI Trust Score](#composite-ai-trust-score) in place of a graph it rejected —
+rejecting the configuration and silently scoring under different semantics are not the same
+outcome.
+
+1. **Missing or malformed required field** — any REQUIRED field absent, or of the wrong
+   type.
+2. **Duplicate node name**, or a `name` that does not match the required pattern.
+3. **Unknown output** — `output` does not name a node in `nodes`.
+4. **Unresolvable reference** — an input references an adapter, component, or node that the
+   scoring configuration does not define.
+5. **Cycle** — see [Evaluation Order and Cycles](#evaluation-order-and-cycles).
+6. **Unknown operator** — the `operator` is neither a core operator nor an extension
+   operator the implementation recognizes. See
+   [Extension operators](#extension-operators).
+7. **Parameter violation** — a required parameter is absent, of the wrong type, or outside
+   its stated range; or a parameter is present that the operator does not declare.
+8. **Weights length mismatch** — `weights` length differs from the node's declared `inputs`
+   length.
+9. **Arity violation** — the number of declared inputs does not match the operator's
+   required arity.
+10. **Unrecognized field** — a field not defined by this section. Implementations MUST
+    reject unrecognized fields, except fields whose names carry a namespace prefix
+    containing a `.` (for example `com.example.hint`), which MUST be ignored. This keeps
+    vendor annotations possible without allowing a typo in a normative field name to pass
+    silently.
+
+Implementations MAY additionally reject a graph that exceeds implementation-defined bounds
+on node count or graph depth; see [Security Considerations](#security-considerations).
+
+Rejection MUST be reported to the caller. An implementation MUST NOT emit
+`trustScores.total` for a configuration whose composition graph it rejected.
+
+#### Graph Identity
+
+A composition graph MUST carry a stable `id`, and the score record MUST include it as
+`trustScoreCompositionId` alongside `trustScoreConfigVersion`, so that a score can be
+traced to the policy that produced it.
+
+The identifier MUST change whenever the graph's **canonical form** changes, and MUST NOT
+change for differences that the canonical form does not preserve — key order, whitespace, or
+number formatting.
+
+##### Canonical form
+
+The canonical form of a composition graph is its JSON serialization with:
+
+- object keys sorted by Unicode code point, at every level;
+- the `id` field omitted, so that the identifier does not depend on itself;
+- arrays — `nodes`, `inputs`, `weights` — in their declared order, which is significant;
+- no insignificant whitespace; and
+- numbers in their shortest round-trippable decimal form.
+
+##### Deriving the identifier
+
+Implementations SHOULD derive the identifier as `sha256:` followed by the lowercase
+hexadecimal SHA-256 digest of the UTF-8 encoding of the canonical form:
+
+```text
+id = "sha256:" HEXLOWER(SHA-256(UTF-8(canonical form)))
+```
+
+A content-derived identifier makes the same policy recognizable across implementations
+rather than only within one provider's namespace: two providers evaluating the same graph
+report the same `trustScoreCompositionId`.
+
+An implementation MAY instead use a provider-assigned identifier, in which case it MUST
+still satisfy the change semantics above. Such an identifier is only meaningful within that
+provider's namespace, and consumers MUST NOT treat equality of provider-assigned identifiers
+across providers as evidence that two policies are the same.
 
 #### Evaluation Order and Cycles
 
@@ -676,10 +882,9 @@ If the output node is unavailable, `trustScores.total` MUST be the value defined
 reported as unavailable. A composition graph that cannot be evaluated MUST NOT produce a score
 of `0`.
 
-When a composition graph has been applied, the score record MUST identify it, so that a score
-can be traced to the policy that produced it. Implementations MUST include a stable
-composition graph identifier alongside `trustScoreConfigVersion`; the identifier MUST change
-whenever the composition graph changes.
+When a composition graph has been applied, the score record MUST identify it as specified in
+[Graph Identity](#graph-identity), so that a score can be traced to the policy that produced
+it.
 
 ##### Reproduction of the composite (normative)
 
@@ -819,27 +1024,31 @@ Implementations SHOULD:
 
 The following test vectors are illustrative and intended to validate deterministic computation and missing-data behavior.
 
+The composition graphs used below are also provided as standalone files, in the
+representation defined in [Graph Configuration](#graph-configuration), under
+[`./hcs-25/examples/`](./hcs-25/examples/README.md).
+
 ### Test Vector 1: Missingness Penalized (Scoped Contribution)
 
 **Configuration (C):**
 
 - Adapters (all applicable) use `contributionMode: scoped`:
   - `availability` (`weight = 1`), components: `availability.uptime`
-  - `simple_evals` (`weight = 2`), components: `simple_evals.math`, `simple_evals.science`
+  - `simple-evals` (`weight = 2`), components: `simple-evals.math`, `simple-evals.science`
   - `reputation` (`weight = 1`), components: `reputation.stars`
 - Stale multiplier: `m_stale = 1`
 
 **Snapshot (S) produces components (already normalized):**
 
 - `availability.uptime = 90` (`ok`)
-- `simple_evals.math = 100` (`ok`)
-- `simple_evals.science` is `missing` → value `0`
+- `simple-evals.math = 100` (`ok`)
+- `simple-evals.science` is `missing` → value `0`
 - `reputation.stars = 40` (`ok`)
 
 **Adapter totals:**
 
 - `total(availability) = 90`
-- `total(simple_evals) = (100 + 0) / 2 = 50`
+- `total(simple-evals) = (100 + 0) / 2 = 50`
 - `total(reputation) = 40`
 
 **Composite:**
@@ -864,7 +1073,7 @@ Then `reputation` is excluded from the denominator and:
 
 Same configuration and snapshot as Test Vector 1, with a composition graph added:
 
-- node `all`: `weightedMean`, inputs `adapter:availability`, `adapter:simple_evals`,
+- node `all`: `weightedMean`, inputs `adapter:availability`, `adapter:simple-evals`,
   `adapter:reputation`, weights `[1, 2, 1]`
 - output: `all`
 
@@ -877,7 +1086,7 @@ the denominator adapters reproduces [Composite AI Trust Score](#composite-ai-tru
 exactly, as required by
 [Reproduction of the composite](#reproduction-of-the-composite-normative).
 
-### Test Vector 4: Safety Floor (a Dimension Governs Rather Than Dilutes)
+### Test Vector 4: Safety Cap (a Dimension Governs Rather Than Dilutes)
 
 **Configuration (C):** four adapters, `contributionMode: scoped`, all `weight = 1`:
 `availability`, `performance`, `reputation`, `sybil-resistance`.
@@ -895,7 +1104,7 @@ trustScore = (90 + 80 + 61 + 24) / 4 = 63.75
 
 - node `quality`: `weightedMean`, inputs `adapter:availability`, `adapter:performance`,
   `adapter:reputation`, weights `[1, 1, 1]`
-- node `governed`: `floor`, inputs `node:quality`, `adapter:sybil-resistance`
+- node `governed`: `cap`, inputs `node:quality`, `adapter:sybil-resistance`
 - output: `governed`
 
 ```
@@ -906,7 +1115,7 @@ value(governed) = min(77, 24)        = 24
 `trustScores.total = 24`.
 
 The contrast is the point. As a fourth term in the mean, a weak Sybil-resistance signal
-moves the score from `77` to `63.75`. As a floor, it governs: the composite cannot exceed
+moves the score from `77` to `63.75`. As a cap, it governs: the composite cannot exceed
 the dimension the configuration declares to be limiting.
 
 ### Test Vector 5: Gate With a Stale, Then Unavailable, Condition
@@ -946,7 +1155,27 @@ unavailable.
 value(governed) = 90   (primary passes through; no constraint applied)
 ```
 
-A missing safety signal neither imposes nor removes a cap.
+**Case (c) — condition is a deterministic `0` from missingness.** `corroboration` instead
+uses `contributionMode: scoped` and its signal times out. Per
+[Missing and Stale Data](#missing-and-stale-data) the component value is `0` with status
+`timeout`, and the adapter remains in the denominator, so `total(corroboration) = 0`.
+
+Without a composition graph: `trustScore = (90 + 0) / 2 = 45`.
+
+```
+condition = 0, status timeout
+→ value(governed) = 90   (primary passes through; no constraint applied)
+```
+
+The condition is numerically `0`, which is below `below = 50`, but that `0` stands for "not
+measured" rather than a measured absence of corroboration. Applying the cap here would
+yield `70` — and under a `cap` node limiting by this adapter directly, `min(90, 0) = 0` —
+on the basis of a signal that never arrived. Per rule 4 of
+[Availability and Status Propagation](#availability-and-status-propagation), a limiting or
+condition input whose status is `missing`, `timeout`, or `error` imposes no constraint.
+
+In all three cases a missing safety signal neither imposes nor removes a cap, and the
+node's status records why.
 
 ## Conformance
 
@@ -1042,6 +1271,26 @@ Next: Optionally expand the signal catalog with more ecosystem-specific signal s
 | ------- | --------- | ----------- |
 | 1.1     | (pending) | Added the OPTIONAL [Composition Graph](#composition-graph-optional): operator catalog, acyclic graph model, availability and status propagation, deterministic evaluation order, and a normative requirement that a one-node `weightedMean` composition graph reproduce the existing composite. Added the OPTIONAL [Score Explanation](#score-explanation-optional). Added Test Vectors 3–5. Updated the Architecture Overview and Composite-score-at-a-glance diagrams to show composition graph as an optional path beside the default weighted mean. Additive only: a configuration that defines no composition graph is evaluated exactly as in 1.0, and support for both sections is OPTIONAL. |
 | 1.0     | —         | Initial draft. |
+
+Review feedback incorporated before merge: the `floor` operator was renamed `cap` (it
+imposes an upper bound — `min()` caps rather than floors); `weightedMean` weights were
+made explicitly bound to *declared* inputs so they cannot slide onto a different input when
+one is unavailable; a limiting or condition input whose status is `missing`, `timeout` or
+`error` now imposes no constraint, so a deterministic `0` standing for "not measured" can
+no longer clamp a composite to zero (Test Vector 5, case (c)); the composition-graph
+representation was made normative with a field-definition table, per-operator parameter
+types, a [Validation](#validation) section and a [Graph Identity](#graph-identity) section
+defining a canonical form and content-derived identifier; extension operators now require
+namespaced, versioned identifiers; an implementation that does not support composition
+graphs MUST reject a configuration containing one rather than silently scoring under the
+default aggregation; and worked graphs were added under
+[`./hcs-25/examples/`](./hcs-25/examples/README.md).
+
+Editorial, required by the new validation rules: Test Vector 1 used `simple_evals` as an
+adapter identifier, which [Adapter Identifier Namespacing](#adapter-identifier-namespacing)
+does not permit. Since [Validation](#validation) now requires every input reference to match
+that pattern, the vector contradicted the document. Corrected to `simple-evals`; no computed
+value changes.
 
 ## License
 
